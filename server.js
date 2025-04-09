@@ -1,3 +1,5 @@
+const { v4: uuidv4 } = require('uuid');
+
 const fastify = require('fastify')({
     logger: true,
     ignoreTrailingSlash: true
@@ -84,12 +86,82 @@ const fastify = require('fastify')({
   }));
   
   // Route pour lister les caméras
-  fastify.get('/cameras', async () => {
-    return fastify.parkkiDB.allAsync('SELECT * FROM cameras ORDER BY created_at DESC');
+  fastify.get('/cameras', async (request, reply) => {
+    const db = fastify.parkkiDB;
+  
+    try {
+      const cameras = await db.allAsync('SELECT * FROM cameras ORDER BY created_at DESC');
+      return cameras; // Renvoie toutes les caméras
+    } catch (error) {
+      reply.code(500).send({
+        error: 'Database Error',
+        message: error.message
+      });
+    }
   });
+
+  fastify.get('/cameras/:id/events', async (request, reply) => {
+    const { id } = request.params;
+    const db = fastify.parkkiDB;
+  
+    try {
+      const events = await db.allAsync(`
+        SELECT * FROM cameras WHERE id = ?
+      `, [id]);
+  
+      return events.map(event => JSON.parse(event.last_event)); // Récupère l'événement sous forme d'objet
+    } catch (error) {
+      reply.code(500).send({
+        error: 'Database Error',
+        message: error.message
+      });
+    }
+  });
+
+  fastify.post('/cameras', {
+    schema: {
+      body: {
+        type: 'object',
+        required: ['name'],
+        properties: {
+          name: { type: 'string' },
+          status: { 
+            type: 'string', 
+            enum: ['online', 'offline'],
+            default: 'offline' 
+          }
+        }
+      }
+    }
+  }, async (request, reply) => {
+    const { name, status } = request.body;
+    const db = fastify.parkkiDB;
+  
+    const id = uuidv4(); // 🔑 Générer un ID unique
+  
+    try {
+      db.prepare('BEGIN TRANSACTION').run();
+  
+      const insertStmt = db.prepare(`
+        INSERT INTO cameras (id, name, status)
+        VALUES (?, ?, ?)
+      `);
+  
+      insertStmt.run(id, name, status);
+      db.prepare('COMMIT').run();
+  
+      return { status: 'success', message: 'Caméra ajoutée avec succès', id };
+    } catch (error) {
+      db.prepare('ROLLBACK').run();
+      reply.code(500).send({ error: 'Database Error', message: error.message });
+    }
+  });  
+  
+  
+  
   
   // Route pour enregistrer un événement d'une caméra
-  fastify.post('/cameras/:id/event', {
+  fastify.post('/cameras/:id/events', {
     schema: {
       params: {
         type: 'object',
@@ -98,57 +170,62 @@ const fastify = require('fastify')({
         }
       },
       body: {
-        type: 'object',
-        required: ['type'],
-        properties: {
-          type: { type: 'string' },
-          timestamp: { type: 'string', format: 'date-time' },
-          confidence: { type: 'number', minimum: 0, maximum: 1 }
+        type: 'array',
+        items: {
+          type: 'object',
+          required: ['type', 'timestamp', 'confidence'],
+          properties: {
+            type: { type: 'string' },
+            timestamp: { type: 'string', format: 'date-time' },
+            confidence: { type: 'number', minimum: 0, maximum: 1 }
+          }
         }
       }
     }
   }, async (request, reply) => {
     const { id } = request.params;
-    const event = {
-      ...request.body,
-      received_at: new Date().toISOString()
-    };
+    const events = request.body;
   
     const db = fastify.parkkiDB;
   
     try {
       db.prepare('BEGIN TRANSACTION').run();
   
-      // Upsert pour la caméra avec événement
-      db.prepare(`
-        INSERT INTO cameras (id, name, status, last_event)
-        VALUES (?, ?, COALESCE((SELECT status FROM cameras WHERE id = ?), 'online'), ?)
-        ON CONFLICT(id) DO UPDATE SET
-          last_event = excluded.last_event,
-          status = excluded.status
-      `).run(id, `Camera-${id}`, id, JSON.stringify(event));
+      // Insérer ou mettre à jour chaque événement pour la caméra donnée
+      events.forEach(event => {
+        db.prepare(`
+          INSERT INTO cameras (id, name, status, last_event)
+          VALUES (?, ?, COALESCE((SELECT status FROM cameras WHERE id = ?), 'online'), ?)
+          ON CONFLICT(id) DO UPDATE SET
+            last_event = excluded.last_event,
+            status = excluded.status
+        `).run(id, `Camera-${id}`, id, JSON.stringify(event));
+      });
   
-      // Envoi de la notification WebSocket à tous les clients connectés
+      // Envoyer une notification WebSocket pour chaque événement
       if (fastify.websocketServer) {
-        const payload = JSON.stringify({
-          camera_id: id,
-          event_type: event.type,
-          timestamp: event.timestamp,
-          confidence: event.confidence
-        });
+        events.forEach(event => {
+          const payload = JSON.stringify({
+            camera_id: id,
+            event_type: event.type,
+            timestamp: event.timestamp,
+            confidence: event.confidence
+          });
   
-        fastify.websocketServer.clients.forEach((client) => {
-          if (client.readyState === WebSocket.OPEN) {
-            client.send(payload);
-          }
+          // Envoyer à tous les clients connectés
+          fastify.websocketServer.clients.forEach(client => {
+            if (client.readyState === client.OPEN) {
+              client.send(payload);
+            }
+          });
         });
       }
   
       db.prepare('COMMIT').run();
-      return {
+      return { 
         status: 'success',
-        message: 'Événement traité',
-        event_id: `${id}-${Date.now()}`
+        message: `${events.length} événements traités`,
+        event_ids: events.map((event, index) => `${id}-${Date.now()}-${index}`)
       };
     } catch (error) {
       db.prepare('ROLLBACK').run();
@@ -162,13 +239,13 @@ const fastify = require('fastify')({
   // Hook pour initialiser la base de données
   fastify.addHook('onReady', async () => {
     await fastify.parkkiDB.runAsync(`
-      CREATE TABLE IF NOT EXISTS cameras (
+        CREATE TABLE IF NOT EXISTS cameras (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
         status TEXT DEFAULT 'offline',
         last_event TEXT,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-      )
+    );
     `);
   });
   
