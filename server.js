@@ -124,6 +124,7 @@ const fastify = require('fastify')({
         type: 'object',
         required: ['name'],
         properties: {
+          custom_id: { type: 'string' }, // optionnel
           name: { type: 'string' },
           status: { 
             type: 'string', 
@@ -134,10 +135,10 @@ const fastify = require('fastify')({
       }
     }
   }, async (request, reply) => {
-    const { name, status } = request.body;
+    const { custom_id, name, status } = request.body;
     const db = fastify.parkkiDB;
   
-    const id = uuidv4(); // 🔑 Générer un ID unique
+    const id = custom_id || uuidv4();
   
     try {
       db.prepare('BEGIN TRANSACTION').run();
@@ -156,8 +157,6 @@ const fastify = require('fastify')({
       reply.code(500).send({ error: 'Database Error', message: error.message });
     }
   });  
-  
-  
   
   
   // Route pour enregistrer un événement d'une caméra
@@ -235,6 +234,48 @@ const fastify = require('fastify')({
       });
     }
   });
+
+
+  // Supprimer toutes les caméras
+
+  fastify.delete('/cameras', async (request, reply) => {
+    const db = fastify.parkkiDB;
+  
+    try {
+      db.prepare('DELETE FROM cameras').run();
+      return { status: 'success', message: 'Toutes les caméras ont été supprimées.' };
+    } catch (error) {
+      reply.code(500).send({
+        error: 'Database Error',
+        message: error.message
+      });
+    }
+  });
+  
+
+  // Supprimer les caméras par leur id
+
+  fastify.delete('/cameras/:id', async (request, reply) => {
+    const { id } = request.params;
+    const db = fastify.parkkiDB;
+  
+    try {
+      const stmt = db.prepare('DELETE FROM cameras WHERE id = ?');
+      const result = stmt.run(id);
+  
+      if (result.changes === 0) {
+        return reply.code(404).send({ error: 'Not Found', message: 'Caméra introuvable' });
+      }
+  
+      return { status: 'success', message: `Caméra ${id} supprimée` };
+    } catch (error) {
+      reply.code(500).send({
+        error: 'Database Error',
+        message: error.message
+      });
+    }
+  });
+  
   
   // Hook pour initialiser la base de données
   fastify.addHook('onReady', async () => {
