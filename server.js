@@ -2,7 +2,14 @@ const { v4: uuidv4 } = require('uuid');
 
 const fastify = require('fastify')({
     logger: true,
-    ignoreTrailingSlash: true
+    ignoreTrailingSlash: true,
+    ajv: {
+        customOptions: {
+          formats: {
+            'date-time': true
+          }
+        }
+    }
   });
   
   // Plugins HTTP
@@ -39,6 +46,7 @@ const fastify = require('fastify')({
     noServer: true,
     perMessageDeflate: false  // Désactive la compression pour éviter l'erreur RSV1
   });
+  
   
   // Stockage des connexions via wss.clients (géré automatiquement par ws)
   
@@ -91,7 +99,10 @@ const fastify = require('fastify')({
   
     try {
       const cameras = await db.allAsync('SELECT * FROM cameras ORDER BY created_at DESC');
-      return cameras; // Renvoie toutes les caméras
+      return cameras.map(camera => ({
+        ...camera,
+        last_event: camera.last_event ? JSON.parse(camera.last_event) : null
+      }));
     } catch (error) {
       reply.code(500).send({
         error: 'Database Error',
@@ -100,16 +111,40 @@ const fastify = require('fastify')({
     }
   });
 
+  fastify.get('/events', async (request, reply) => {
+    const db = fastify.parkkiDB;
+  
+    try {
+      const events = db.prepare(`SELECT * FROM events ORDER BY timestamp DESC`).all();
+  
+      return {
+        status: 'success',
+        total: events.length,
+        events
+      };
+    } catch (error) {
+      reply.code(500).send({
+        error: 'Database Error',
+        message: error.message
+      });
+    }
+  });
+  
+
   fastify.get('/cameras/:id/events', async (request, reply) => {
     const { id } = request.params;
     const db = fastify.parkkiDB;
   
     try {
-      const events = await db.allAsync(`
-        SELECT * FROM cameras WHERE id = ?
-      `, [id]);
+      const events = db.prepare(`
+        SELECT * FROM events WHERE camera_id = ?
+        ORDER BY timestamp DESC
+      `).all(id);
   
-      return events.map(event => JSON.parse(event.last_event)); // Récupère l'événement sous forme d'objet
+      return {
+        status: 'success',
+        events
+      };
     } catch (error) {
       reply.code(500).send({
         error: 'Database Error',
@@ -159,14 +194,14 @@ const fastify = require('fastify')({
   });  
   
   
-  // Route pour enregistrer un événement d'une caméra
   fastify.post('/cameras/:id/events', {
     schema: {
       params: {
         type: 'object',
         properties: {
           id: { type: 'string' }
-        }
+        },
+        required: ['id']
       },
       body: {
         type: 'array',
@@ -184,47 +219,75 @@ const fastify = require('fastify')({
   }, async (request, reply) => {
     const { id } = request.params;
     const events = request.body;
-  
     const db = fastify.parkkiDB;
   
     try {
       db.prepare('BEGIN TRANSACTION').run();
   
-      // Insérer ou mettre à jour chaque événement pour la caméra donnée
-      events.forEach(event => {
-        db.prepare(`
-          INSERT INTO cameras (id, name, status, last_event)
-          VALUES (?, ?, COALESCE((SELECT status FROM cameras WHERE id = ?), 'online'), ?)
-          ON CONFLICT(id) DO UPDATE SET
-            last_event = excluded.last_event,
-            status = excluded.status
-        `).run(id, `Camera-${id}`, id, JSON.stringify(event));
-      });
+      // Route pour insérer un événement dans la base de données
+      const insertEvent = db.prepare(`
+        INSERT INTO events (id, camera_id, type, confidence, timestamp, received_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `);
   
-      // Envoyer une notification WebSocket pour chaque événement
-      if (fastify.websocketServer) {
-        events.forEach(event => {
+      // Route pour mettre à jour l'événement dans la caméra (last_event)
+      const updateCamera = db.prepare(`
+        UPDATE cameras
+        SET last_event = ?
+        WHERE id = ?
+      `);
+  
+      // Traitement de chaque événement envoyé
+      events.forEach(event => {
+        const event_id = uuidv4(); // Générer un ID unique pour chaque événement
+        const received_at = new Date().toISOString(); // Date/heure du traitement de l'événement
+  
+        // Insérer l'événement dans la table 'events'
+        insertEvent.run(
+          event_id,
+          id, // ID de la caméra
+          event.type,
+          event.confidence,
+          event.timestamp,
+          received_at
+        );
+  
+        // Mettre à jour le champ last_event de la caméra
+        const formattedEvent = {
+            id: event_id,
+            type: event.type,
+            timestamp: event.timestamp,
+            confidence: event.confidence,
+            received_at,
+            summary: `Mouvement détecté (${(event.confidence * 100).toFixed(0)}%)`
+          };
+          
+        updateCamera.run(JSON.stringify(formattedEvent), id);
+  
+        // Diffuser l'événement via WebSocket à tous les clients connectés
+        if (fastify.websocketServer) {
           const payload = JSON.stringify({
             camera_id: id,
+            event_id,
             event_type: event.type,
             timestamp: event.timestamp,
             confidence: event.confidence
           });
   
-          // Envoyer à tous les clients connectés
           fastify.websocketServer.clients.forEach(client => {
             if (client.readyState === client.OPEN) {
               client.send(payload);
             }
           });
-        });
-      }
+        }
+      });
   
       db.prepare('COMMIT').run();
-      return { 
+  
+      return {
         status: 'success',
-        message: `${events.length} événements traités`,
-        event_ids: events.map((event, index) => `${id}-${Date.now()}-${index}`)
+        message: `${events.length} événement(s) enregistré(s)`,
+        event_ids: events.map(() => uuidv4()) // Générer un ID unique pour chaque événement ajouté
       };
     } catch (error) {
       db.prepare('ROLLBACK').run();
@@ -233,7 +296,7 @@ const fastify = require('fastify')({
         message: error.message
       });
     }
-  });
+  });  
 
 
   // Supprimer toutes les caméras
@@ -278,6 +341,7 @@ const fastify = require('fastify')({
   
   
   // Hook pour initialiser la base de données
+
   fastify.addHook('onReady', async () => {
     await fastify.parkkiDB.runAsync(`
         CREATE TABLE IF NOT EXISTS cameras (
@@ -288,7 +352,19 @@ const fastify = require('fastify')({
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
     `);
+    await fastify.parkkiDB.runAsync(`
+        CREATE TABLE IF NOT EXISTS events (
+          id TEXT PRIMARY KEY,
+          camera_id TEXT NOT NULL,
+          type TEXT NOT NULL,
+          confidence REAL,
+          timestamp DATETIME NOT NULL,
+          received_at DATETIME NOT NULL,
+          FOREIGN KEY (camera_id) REFERENCES cameras(id) ON DELETE CASCADE
+        );
+    `);
   });
+
   
   // --- Lancement du serveur ---
   const start = async () => {
